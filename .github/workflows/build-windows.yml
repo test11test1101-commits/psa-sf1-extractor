@@ -1,0 +1,54 @@
+name: Build Windows Installer
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest -v
+
+      - name: Build standalone .exe with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+            --name "PSA_SF1_Extractor" `
+            --collect-all rapidocr_onnxruntime `
+            --collect-all pypdfium2 `
+            app.py
+
+      - name: Install Inno Setup
+        shell: cmd
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Windows Setup Installer (.exe)
+        shell: cmd
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Upload Windows .exe and Setup Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSA-SF1-Extractor-Windows
+          path: |
+            dist/PSA_SF1_Extractor.exe
+            dist/PSA_SF1_Extractor_Setup.exe
+
