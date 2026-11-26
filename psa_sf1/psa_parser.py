@@ -39,12 +39,24 @@ SUBHEADER_TOKENS = {
 
 
 def detect_psa_format(full_text: str) -> Tuple[str, Optional[str]]:
-    """Detect whether the document is 2007 or current PSA format.
+    """Detect whether the document is a 2007 or current PSA Certificate of Live Birth.
 
     Returns (format_label, warning_if_unsupported).
     """
     upper = full_text.upper()
     compact = re.sub(r"\s+", "", upper)
+
+    if "CERTIFICATEOFMARRIAGE" in compact or "FORMNO.97" in compact or "FORMNO97" in compact:
+        return (
+            "Marriage Cert (Form 97)",
+            "Not a Birth Certificate (detected Certificate of Marriage). Please upload a PSA Certificate of Live Birth (2007 or current).",
+        )
+
+    if "CERTIFICATEOFDEATH" in compact or "FORMNO.103" in compact or "FORMNO103" in compact:
+        return (
+            "Death Cert (Form 103)",
+            "Not a Birth Certificate (detected Certificate of Death). Please upload a PSA Certificate of Live Birth (2007 or current).",
+        )
 
     if "REVISED1993" in compact or "REV.1993" in compact:
         return "Pre-2007 (1993)", "Unsupported PSA format (1993). Only 2007 or current format is supported."
@@ -82,6 +94,13 @@ def parse_psa_document(
     warnings: List[str] = []
     if fmt_warning:
         warnings.append(fmt_warning)
+        if fmt.startswith("Marriage Cert") or fmt.startswith("Death Cert"):
+            return PSADocumentRecord(
+                source_file=source_file,
+                format_detected=fmt,
+                status="Check",
+                warnings=warnings,
+            )
 
     page_width = max((b.x_max for b in blocks), default=1600.0)
 

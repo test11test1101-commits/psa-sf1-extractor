@@ -172,6 +172,15 @@ def test_parser_rejects_1993_format_warning() -> None:
     assert any("1993" in w for w in rec.warnings)
 
 
+def test_parser_flags_marriage_certificate() -> None:
+    text = "PHILIPPINE STATISTICS AUTHORITY\nMunicipal Form No. 97\nCERTIFICATE OF MARRIAGE\n1. Name of Contracting Parties"
+    rec = parse_psa_document("marriage.jpg", [], text)
+    assert "Marriage" in rec.format_detected
+    assert rec.status == "Check"
+    assert rec.name == ""
+    assert any("Certificate of Marriage" in w for w in rec.warnings)
+
+
 def test_opencv_cleaner_preserves_dimensions() -> None:
     raw = np.full((600, 800, 3), 245, dtype=np.uint8)
     cv2.putText(raw, "PHILIPPINE STATISTICS AUTHORITY", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
