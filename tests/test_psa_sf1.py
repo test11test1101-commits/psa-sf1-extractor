@@ -16,19 +16,39 @@ from psa_sf1.psa_parser import parse_psa_document
 from psa_sf1.sf1_exporter import SF1_COLUMNS, export_to_sf1_xlsx
 
 
+def _load_font(size: int, bold: bool = False) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    candidates = (
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            "arialbd.ttf",
+        ]
+        if bold
+        else [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "arial.ttf",
+        ]
+    )
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def _make_synthetic_psa_image(out_path: Path, as_pdf: bool = False) -> Path:
     """Create a realistic synthetic PSA Certificate of Live Birth (Current format) image or PDF."""
     img = Image.new("RGB", (1400, 1800), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
 
-    try:
-        font_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
-        font_md = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-        font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
-    except OSError:
-        font_lg = ImageFont.load_default()
-        font_md = font_lg
-        font_sm = font_lg
+    font_lg = _load_font(26, bold=True)
+    font_md = _load_font(22, bold=False)
+    font_sm = _load_font(17, bold=False)
 
     draw.text((340, 50), "PHILIPPINE STATISTICS AUTHORITY", fill=(0, 0, 0), font=font_lg)
     draw.text((380, 90), "CERTIFICATE OF LIVE BIRTH", fill=(0, 0, 0), font=font_lg)
