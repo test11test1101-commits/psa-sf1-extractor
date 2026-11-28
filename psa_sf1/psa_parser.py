@@ -141,11 +141,16 @@ def parse_psa_document(
     )
 
 
-def _find_anchor(blocks: List[OCRBlock], patterns: List[str], min_y: float = 0.0) -> Optional[OCRBlock]:
-    """Find the first OCR block matching any regex pattern at or below min_y."""
+def _find_anchor(
+    blocks: List[OCRBlock],
+    patterns: List[str],
+    min_y: float = 0.0,
+    max_y: float = 1e9,
+) -> Optional[OCRBlock]:
+    """Find the first OCR block matching any regex pattern between min_y and max_y."""
     compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
     for block in sorted(blocks, key=lambda b: (b.y_center, b.x_min)):
-        if block.y_center < min_y:
+        if block.y_center < min_y or block.y_center > max_y:
             continue
         for pat in compiled:
             if pat.search(block.text):
@@ -252,7 +257,11 @@ def _format_first_middle_last_text(raw: str) -> str:
 
 
 def _extract_child_name(blocks: List[OCRBlock], full_text: str, page_width: float) -> str:
-    anchor = _find_anchor(blocks, [r"\b1[\.\)]?\s*NAME\b", r"^[1IEL\.\)]*\s*NAME$"])
+    page_height = max((b.y_max for b in blocks), default=2000.0)
+    mother_anchor = _find_anchor(blocks, [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"\b7[\.\)]?\s*MAIDEN\b"])
+    top_limit = min(page_height * 0.45, mother_anchor.y_min - 5.0) if mother_anchor else page_height * 0.45
+
+    anchor = _find_anchor(blocks, [r"\b1[\.\)]?\s*NAME\b", r"^[1IEL\.\)]*\s*NAME$"], max_y=top_limit)
     if anchor:
         sex_anchor = _find_anchor(blocks, [r"\b2[\.\)]?\s*SEX\b"])
         # Only restrict right boundary if 2. SEX sits on the same horizontal row as 1. NAME.
