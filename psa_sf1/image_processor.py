@@ -59,7 +59,7 @@ def _render_pdf_pages(pdf_path: Path, dpi: int = 250) -> List[np.ndarray]:
     return images
 
 
-def clean_image_for_ocr(image: np.ndarray, min_width: int = 1600) -> np.ndarray:
+def clean_image_for_ocr(image: np.ndarray, min_width: int = 2200) -> np.ndarray:
     """Clean a scanned PSA document image using OpenCV for accurate OCR.
 
     Steps:
@@ -86,38 +86,43 @@ def clean_image_for_ocr(image: np.ndarray, min_width: int = 1600) -> np.ndarray:
             interpolation=cv2.INTER_CUBIC,
         )
 
-    denoised = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
-    deskewed = _deskew(denoised)
+    deskewed = _deskew(gray)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(deskewed)
+    # Remove yellow/pink PSA security paper tint & uneven scanner shadows by dividing by local background.
+    bg = cv2.GaussianBlur(deskewed, (0, 0), sigmaX=25, sigmaY=25)
+    normalized = cv2.divide(deskewed, bg, scale=255)
+
+    # Gentle unsharp mask so small form labels and thin dot-matrix text stay crisp for OCR.
+    blurred = cv2.GaussianBlur(normalized, (0, 0), sigmaX=1.2)
+    sharpened = cv2.addWeighted(normalized, 1.35, blurred, -0.35, 0)
+
+    clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
+    enhanced = clahe.apply(sharpened)
 
     # Convert back to 3-channel BGR so deep-learning OCR (RapidOCR) and Tesseract both accept it.
     return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
 
 def _deskew(gray: np.ndarray) -> np.ndarray:
-    """Correct small skew angles (between 0.5 and 15 degrees) using text contour orientation."""
-    inverted = cv2.bitwise_not(gray)
-    _, thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    """Correct small skew angles (0.5 to 15 degrees) using horizontal form lines."""
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    min_len = max(80, gray.shape[1] // 10)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=min_len, maxLineGap=20)
 
-    coords = np.column_stack(np.where(thresh > 0))
-    if len(coords) < 200:
+    angles: List[float] = []
+    if lines is not None:
+        for x1, y1, x2, y2 in lines.reshape(-1, 4):
+            dx, dy = int(x2) - int(x1), int(y2) - int(y1)
+            if abs(dx) < 20:
+                continue
+            deg = float(np.degrees(np.arctan2(dy, dx)))
+            if -15.0 <= deg <= 15.0:
+                angles.append(deg)
+
+    if not angles:
         return gray
 
-    # Subsample large point clouds for speed.
-    if len(coords) > 50000:
-        step = len(coords) // 50000
-        coords = coords[::step]
-
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = -(90 + angle)
-    elif angle > 45:
-        angle = 90 - angle
-    else:
-        angle = -angle
-
+    angle = float(np.median(angles))
     if abs(angle) < 0.5 or abs(angle) > 15.0:
         return gray
 

@@ -10,6 +10,7 @@ Extracts ONLY:
 
 from __future__ import annotations
 
+import difflib
 import re
 from typing import List, Optional, Tuple
 
@@ -35,7 +36,8 @@ SUBHEADER_TOKENS = {
     "(first)", "first", "(middle)", "middle", "(last)", "last",
     "(day)", "day", "(month)", "month", "(year)", "year",
     "first)", "middle)", "last)", "(first", "(middle", "(last",
-    "(s)", "(oppiw)", "(oippi)", "(uguod)", "(yess)",
+    "irst", "iddle", "ast", "las", "firs", "midd",
+    "(s)", "(oppiw)", "(oippi)", "(uguod)", "(yess)", "(resrn)", "(lm)",
     "name", "birth",
 }
 
@@ -222,7 +224,7 @@ def _first_value_line(blocks: List[OCRBlock]) -> List[OCRBlock]:
         return []
     blocks_sorted = sorted(blocks, key=lambda b: (b.y_center, b.x_min))
     first_y = blocks_sorted[0].y_center
-    y_tol = max(16.0, blocks_sorted[0].height * 0.9)
+    y_tol = max(26.0, blocks_sorted[0].height * 1.5)
     return [b for b in blocks_sorted if abs(b.y_center - first_y) <= y_tol]
 
 
@@ -261,9 +263,20 @@ def _extract_child_name(blocks: List[OCRBlock], full_text: str, page_width: floa
     mother_anchor = _find_anchor(blocks, [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"\b7[\.\)]?\s*MAIDEN\b"])
     top_limit = min(page_height * 0.45, mother_anchor.y_min - 5.0) if mother_anchor else page_height * 0.45
 
-    anchor = _find_anchor(blocks, [r"\b1[\.\)]?\s*NAME\b", r"^[1IEL\.\)]*\s*NAME$"], max_y=top_limit)
+    anchor = _find_anchor(
+        blocks,
+        [r"\b1[\.\)]?\s*NAME\b", r"^[1IEL\.\)]*\s*NAME$", r"^[1IEL\.\)]*\s*NA[AM]N$"],
+        max_y=top_limit,
+    )
+    if not anchor:
+        # Fallback: find the form header ("CERTIFICATE OF LIVE BIRTH" or "City/Municipality") above 3. DATE OF BIRTH
+        anchor = _find_anchor(blocks, [r"City.?Municipality", r"CERTIFICATE\s*OF\s*LIVE\s*BIRTH"], max_y=top_limit)
+        use_full_x = True
+    else:
+        use_full_x = False
+
     if anchor:
-        sex_anchor = _find_anchor(blocks, [r"\b2[\.\)]?\s*SEX\b"])
+        sex_anchor = _find_anchor(blocks, [r"\b2[\.\)]?\s*SEX\b"], max_y=top_limit)
         # Only restrict right boundary if 2. SEX sits on the same horizontal row as 1. NAME.
         same_row_sex = (
             sex_anchor is not None
@@ -273,8 +286,8 @@ def _extract_child_name(blocks: List[OCRBlock], full_text: str, page_width: floa
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"^\s*2[\.\)]", r"\b2[\.\)]?\s*SEX\b", r"\b3[\.\)]?\s*DATE\s*OF"],
-            x_min=anchor.x_min,
+            stop_patterns=[r"^\s*2[\.\)]", r"\b2[\.\)]?\s*SEX\b", r"\b3?[\.\)]?\s*[DO]ATE\s*OF"],
+            x_min=0.0 if use_full_x else anchor.x_min,
             x_max=x_max,
         )
         formatted = _format_person_name_blocks(region)
@@ -293,7 +306,9 @@ def _extract_child_name(blocks: List[OCRBlock], full_text: str, page_width: floa
 
 
 def _extract_sex(blocks: List[OCRBlock], full_text: str, page_width: float) -> str:
-    anchor = _find_anchor(blocks, [r"\b2[\.\)]?\s*SEX\b"])
+    page_height = max((b.y_max for b in blocks), default=2000.0)
+    top_limit = page_height * 0.45
+    anchor = _find_anchor(blocks, [r"\b2[\.\)]?\s*SEX\b"], max_y=top_limit)
     if anchor:
         region = _collect_region_blocks(
             blocks,
@@ -306,6 +321,12 @@ def _extract_sex(blocks: List[OCRBlock], full_text: str, page_width: float) -> s
         parsed = _parse_sex_text(region_text)
         if parsed:
             return parsed
+
+    # Fallback: standalone MALE / FEMALE in the top child section
+    top_text = " ".join(b.text for b in blocks if b.y_center <= top_limit)
+    parsed = _parse_sex_text(top_text)
+    if parsed:
+        return parsed
 
     m = re.search(r"2[\.\)]?\s*SEX([^\n]*(?:\n[^\n]{1,60})?)", full_text, re.IGNORECASE)
     if m:
@@ -332,19 +353,28 @@ def _parse_sex_text(text: str) -> str:
 
 
 def _extract_birthdate(blocks: List[OCRBlock], full_text: str) -> str:
+    page_height = max((b.y_max for b in blocks), default=2000.0)
+    mother_anchor = _find_anchor(blocks, [r"\b7[\.\)]?\s*MAID[EI]N\b", r"\bMAID[EI]N\b"])
+    top_limit = min(page_height * 0.45, mother_anchor.y_min - 5.0) if mother_anchor else page_height * 0.45
+
     anchor = _find_anchor(
         blocks,
-        [r"\b3[\.\)]?\s*DATE\s*OF\s*BIRTH\b", r"\b3[\.\)]?\s*DATE\s*OF\b", r"DATE\s*OF\s*BIRTH"],
+        [
+            r"\b3[\.\)]?\s*[DO]ATE\s*OF\s*BIRTH\b",
+            r"\b3?[\.\)]?\s*[DO]ATE\s*OF\b",
+            r"DATE\s*OF\s*BIRTH",
+        ],
+        max_y=top_limit,
     )
     if anchor:
         region = _collect_region_blocks(
             blocks,
             anchor,
             stop_patterns=[r"^\s*4[\.\)]", r"\b4[\.\)]?\s*PLACE", r"^\s*5[\.\)]"],
-            x_min=0.0,
+            x_min=anchor.x_min,
             x_max=1e9,
         )
-        filtered = _filter_subheaders(region)
+        filtered = _first_value_line(_filter_subheaders(region))
         filtered.sort(key=lambda b: b.x_min)
         raw = " ".join(b.text for b in filtered)
         parsed = _normalize_date(raw)
@@ -363,6 +393,17 @@ def _extract_birthdate(blocks: List[OCRBlock], full_text: str) -> str:
     return ""
 
 
+def _lookup_month(token: str) -> Optional[str]:
+    key = token.lower().strip()
+    if key in MONTH_MAP:
+        return MONTH_MAP[key]
+    if len(key) >= 4:
+        matches = difflib.get_close_matches(key, MONTH_MAP.keys(), n=1, cutoff=0.72)
+        if matches:
+            return MONTH_MAP[matches[0]]
+    return None
+
+
 def _normalize_date(raw: str) -> str:
     """Normalize PSA birthdate (Day Month Year or Month Day Year or numeric) to MM/DD/YYYY."""
     text = re.sub(r"[,.;]+", " ", raw)
@@ -372,15 +413,15 @@ def _normalize_date(raw: str) -> str:
 
     m = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", text)
     if m:
-        day, month_str, year = int(m.group(1)), m.group(2).lower(), m.group(3)
-        month = MONTH_MAP.get(month_str)
+        day, month_str, year = int(m.group(1)), m.group(2), m.group(3)
+        month = _lookup_month(month_str)
         if month and 1 <= day <= 31:
             return f"{month}/{day:02d}/{year}"
 
     m = re.search(r"\b([A-Za-z]+)\s+(\d{1,2})\s+(\d{4})\b", text)
     if m:
-        month_str, day, year = m.group(1).lower(), int(m.group(2)), m.group(3)
-        month = MONTH_MAP.get(month_str)
+        month_str, day, year = m.group(1), int(m.group(2)), m.group(3)
+        month = _lookup_month(month_str)
         if month and 1 <= day <= 31:
             return f"{month}/{day:02d}/{year}"
 
@@ -398,13 +439,13 @@ def _normalize_date(raw: str) -> str:
 def _extract_mother_maiden_name(blocks: List[OCRBlock], full_text: str) -> str:
     anchor = _find_anchor(
         blocks,
-        [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"\b7[\.\)]?\s*MAIDEN\b", r"MAIDEN\s*NAME"],
+        [r"\b7[\.\)]?\s*MAID[EI]N\s*NAME\b", r"\b7[\.\)]?\s*MAID[EI]N\b", r"\bMAID[EI]N\b"],
     )
     if anchor:
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"^\s*8[\.\)]", r"^\s*9[\.\)]", r"\b8[\.\)]?\s*CITIZEN"],
+            stop_patterns=[r"^\s*8[\.\)]", r"^\s*9[\.\)]", r"\b8[\.\)]?\s*CITIZEN", r"\bCT[VI]E?N", r"\bFILIPINO\b"],
             x_min=anchor.x_min,
             x_max=1e9,
         )
@@ -426,21 +467,23 @@ def _extract_mother_maiden_name(blocks: List[OCRBlock], full_text: str) -> str:
 def _extract_father_name(blocks: List[OCRBlock], full_text: str) -> str:
     mother_anchor = _find_anchor(
         blocks,
-        [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"\b7[\.\)]?\s*MAIDEN\b", r"MAIDEN\s*NAME"],
+        [r"\b7[\.\)]?\s*MAID[EI]N\s*NAME\b", r"\b7[\.\)]?\s*MAID[EI]N\b", r"\bMAID[EI]N\b"],
     )
     min_y = mother_anchor.y_max if mother_anchor else 0.0
+    marriage_anchor = _find_anchor(blocks, [r"\b20[a-z]?[\.\)]?\s*DATE\b", r"MARRIAGE\s*OF\s*PARENTS"], min_y=min_y)
+    max_y = marriage_anchor.y_min if marriage_anchor else 1e9
 
-    anchor = _find_anchor(blocks, [r"\b14[\.\)]?\s*NAME\b"], min_y=min_y)
+    anchor = _find_anchor(blocks, [r"\b1?4[\.,\)]?\s*NAME\b"], min_y=min_y, max_y=max_y)
     if not anchor:
-        father_hdr = _find_anchor(blocks, [r"\bFATHER\b"], min_y=min_y)
+        father_hdr = _find_anchor(blocks, [r"\bFATHER\b", r"\b13[\.,\)]?\s*RESIDENCE"], min_y=min_y, max_y=max_y)
         if father_hdr:
-            anchor = _find_anchor(blocks, [r"\bNAME\b"], min_y=father_hdr.y_min)
+            anchor = _find_anchor(blocks, [r"\bNAME\b"], min_y=father_hdr.y_min, max_y=max_y)
 
     if anchor:
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"^\s*15[\.\)]", r"^\s*16[\.\)]", r"^\s*19[\.\)]", r"\b15[\.\)]?\s*CITIZEN"],
+            stop_patterns=[r"^\s*15[\.,\)]", r"^\s*16[\.,\)]", r"^\s*19[\.,\)]", r"\b15[\.,\)]?\s*CIT"],
             x_min=anchor.x_min,
             x_max=1e9,
         )
