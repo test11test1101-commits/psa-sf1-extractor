@@ -35,6 +35,8 @@ SUBHEADER_TOKENS = {
     "(first)", "first", "(middle)", "middle", "(last)", "last",
     "(day)", "day", "(month)", "month", "(year)", "year",
     "first)", "middle)", "last)", "(first", "(middle", "(last",
+    "(s)", "(oppiw)", "(oippi)", "(uguod)", "(yess)",
+    "name", "birth",
 }
 
 
@@ -74,10 +76,10 @@ def detect_psa_format(full_text: str) -> Tuple[str, Optional[str]]:
         or ("MAIDENNAME" in compact and "DATEOFBIRTH" in compact)
     )
 
-    if is_current:
-        return "Current (PSA)", None
     if is_2007:
         return "2007 (NSO/PSA)", None
+    if is_current:
+        return "Current (PSA)", None
     if has_form_102_fields:
         return "PSA (2007/Current)", None
 
@@ -173,8 +175,10 @@ def _collect_region_blocks(
             continue
         if b.x_center < x_min or b.x_center > x_max:
             continue
+        # Ignore single-letter vertical margin labels (C-H-I-L-D, M-O-T-H-E-R, F-A-T-H-E-R).
+        if len(b.text.strip()) <= 1 and b.x_max <= anchor.x_min + 5.0:
+            continue
         if any(pat.search(b.text) for pat in stop_re):
-            # Stop collecting if we hit the next numbered section below the anchor.
             if b.y_center > anchor.y_center + anchor.height * 0.5:
                 y_limit = min(y_limit, b.y_min)
             continue
@@ -187,7 +191,11 @@ def _filter_subheaders(blocks: List[OCRBlock]) -> List[OCRBlock]:
     """Remove form subheader tokens like (First), (Middle), (Last), (Day), (Month), (Year)."""
     cleaned: List[OCRBlock] = []
     for b in blocks:
-        tokens = [t for t in b.text.split() if t.lower().strip(",.;:") not in SUBHEADER_TOKENS]
+        tokens = [
+            t for t in b.text.split()
+            if t.lower().strip(",.;:") not in SUBHEADER_TOKENS
+            and not re.fullmatch(r"\([^)]{1,10}\)", t)
+        ]
         joined = " ".join(tokens).strip()
         if joined:
             cleaned.append(
@@ -203,13 +211,22 @@ def _filter_subheaders(blocks: List[OCRBlock]) -> List[OCRBlock]:
     return cleaned
 
 
+def _first_value_line(blocks: List[OCRBlock]) -> List[OCRBlock]:
+    """Return only the blocks belonging to the first horizontal value line."""
+    if not blocks:
+        return []
+    blocks_sorted = sorted(blocks, key=lambda b: (b.y_center, b.x_min))
+    first_y = blocks_sorted[0].y_center
+    y_tol = max(16.0, blocks_sorted[0].height * 0.9)
+    return [b for b in blocks_sorted if abs(b.y_center - first_y) <= y_tol]
+
+
 def _format_person_name_blocks(blocks: List[OCRBlock]) -> str:
     """Format blocks ordered left-to-right as (First, Middle, Last) -> 'LAST, FIRST MIDDLE'."""
-    filtered = _filter_subheaders(blocks)
+    filtered = _first_value_line(_filter_subheaders(blocks))
     if not filtered:
         return ""
 
-    # Sort by x_min because PSA forms lay out First | Middle | Last left-to-right.
     filtered.sort(key=lambda b: b.x_min)
     raw = " ".join(b.text for b in filtered)
     return _format_first_middle_last_text(raw)
@@ -229,28 +246,32 @@ def _format_first_middle_last_text(raw: str) -> str:
         return words[0].upper()
     if len(words) == 2:
         return f"{words[1].upper()}, {words[0].upper()}"
-    # Assume last word is surname, preceding words are First + Middle.
     last = words[-1].upper()
     first_middle = " ".join(w.upper() for w in words[:-1])
     return f"{last}, {first_middle}"
 
 
 def _extract_child_name(blocks: List[OCRBlock], full_text: str, page_width: float) -> str:
-    anchor = _find_anchor(blocks, [r"\b1[\.\)]?\s*NAME\b"])
+    anchor = _find_anchor(blocks, [r"\b1[\.\)]?\s*NAME\b", r"^[1IEL\.\)]*\s*NAME$"])
     if anchor:
+        sex_anchor = _find_anchor(blocks, [r"\b2[\.\)]?\s*SEX\b"])
+        # Only restrict right boundary if 2. SEX sits on the same horizontal row as 1. NAME.
+        same_row_sex = (
+            sex_anchor is not None
+            and abs(sex_anchor.y_center - anchor.y_center) <= max(30.0, anchor.height * 1.5)
+        )
+        x_max = min(page_width * 0.72, sex_anchor.x_min - 5.0) if same_row_sex else 1e9
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"\b2[\.\)]?\s*SEX\b", r"\b3[\.\)]?\s*DATE\s*OF\s*BIRTH\b"],
-            x_min=0.0,
-            x_max=page_width * 0.72,
+            stop_patterns=[r"^\s*2[\.\)]", r"\b2[\.\)]?\s*SEX\b", r"\b3[\.\)]?\s*DATE\s*OF"],
+            x_min=anchor.x_min,
+            x_max=x_max,
         )
-        # Exclude the anchor text prefix if OCR merged "1. NAME" with something.
         formatted = _format_person_name_blocks(region)
         if formatted:
             return formatted
 
-    # Text-line fallback
     m = re.search(
         r"1[\.\)]?\s*NAME.*?(?:\(First\).*?\(Last\))?\s*\n([^\n]+)",
         full_text,
@@ -268,16 +289,15 @@ def _extract_sex(blocks: List[OCRBlock], full_text: str, page_width: float) -> s
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"\b3[\.\)]?\s*DATE\s*OF\s*BIRTH\b", r"\b4[\.\)]?\s*PLACE"],
+            stop_patterns=[r"^\s*3[\.\)]", r"^\s*4[\.\)]", r"\b4[\.\)]?\s*PLACE"],
             x_min=max(0.0, anchor.x_min - 40.0),
-            x_max=page_width,
+            x_max=anchor.x_max + 200.0,
         )
         region_text = " ".join(b.text for b in region)
         parsed = _parse_sex_text(region_text)
         if parsed:
             return parsed
 
-    # Text fallback around "2. SEX"
     m = re.search(r"2[\.\)]?\s*SEX([^\n]*(?:\n[^\n]{1,60})?)", full_text, re.IGNORECASE)
     if m:
         parsed = _parse_sex_text(m.group(1))
@@ -288,13 +308,11 @@ def _extract_sex(blocks: List[OCRBlock], full_text: str, page_width: float) -> s
 
 def _parse_sex_text(text: str) -> str:
     upper = text.upper()
-    # Explicit checked markers like [X] Male, X 1 Male, ✓ Female, etc.
     if re.search(r"(?:[X✓✔☑]\s*1?\s*MALE|1\s*MALE\s*[X✓✔☑])", upper):
         return "M"
     if re.search(r"(?:[X✓✔☑]\s*2?\s*FEMALE|2\s*FEMALE\s*[X✓✔☑])", upper):
         return "F"
 
-    # Standalone word (when only the selected sex is printed/typed, e.g., "FEMALE" or "MALE")
     has_male = bool(re.search(r"\bMALE\b", upper))
     has_female = bool(re.search(r"\bFEMALE\b", upper))
     if has_male and not has_female:
@@ -305,12 +323,15 @@ def _parse_sex_text(text: str) -> str:
 
 
 def _extract_birthdate(blocks: List[OCRBlock], full_text: str) -> str:
-    anchor = _find_anchor(blocks, [r"\b3[\.\)]?\s*DATE\s*OF\s*BIRTH\b", r"DATE\s*OF\s*BIRTH"])
+    anchor = _find_anchor(
+        blocks,
+        [r"\b3[\.\)]?\s*DATE\s*OF\s*BIRTH\b", r"\b3[\.\)]?\s*DATE\s*OF\b", r"DATE\s*OF\s*BIRTH"],
+    )
     if anchor:
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"\b4[\.\)]?\s*PLACE\s*OF\s*BIRTH\b", r"\b5[\.\)]?\s*TYPE"],
+            stop_patterns=[r"^\s*4[\.\)]", r"\b4[\.\)]?\s*PLACE", r"^\s*5[\.\)]"],
             x_min=0.0,
             x_max=1e9,
         )
@@ -340,7 +361,6 @@ def _normalize_date(raw: str) -> str:
     if not text:
         return ""
 
-    # Pattern 1: DD Month YYYY (standard PSA Form 102 order: Day | Month | Year)
     m = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", text)
     if m:
         day, month_str, year = int(m.group(1)), m.group(2).lower(), m.group(3)
@@ -348,7 +368,6 @@ def _normalize_date(raw: str) -> str:
         if month and 1 <= day <= 31:
             return f"{month}/{day:02d}/{year}"
 
-    # Pattern 2: Month DD YYYY
     m = re.search(r"\b([A-Za-z]+)\s+(\d{1,2})\s+(\d{4})\b", text)
     if m:
         month_str, day, year = m.group(1).lower(), int(m.group(2)), m.group(3)
@@ -356,7 +375,6 @@ def _normalize_date(raw: str) -> str:
         if month and 1 <= day <= 31:
             return f"{month}/{day:02d}/{year}"
 
-    # Pattern 3: Numeric MM/DD/YYYY or MM-DD-YYYY
     m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", text)
     if m:
         a, b, year = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -369,13 +387,16 @@ def _normalize_date(raw: str) -> str:
 
 
 def _extract_mother_maiden_name(blocks: List[OCRBlock], full_text: str) -> str:
-    anchor = _find_anchor(blocks, [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"MAIDEN\s*NAME"])
+    anchor = _find_anchor(
+        blocks,
+        [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"\b7[\.\)]?\s*MAIDEN\b", r"MAIDEN\s*NAME"],
+    )
     if anchor:
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"\b8[\.\)]?\s*CITIZENSHIP\b", r"\b9[\.\)]?\s*RELIGION\b"],
-            x_min=0.0,
+            stop_patterns=[r"^\s*8[\.\)]", r"^\s*9[\.\)]", r"\b8[\.\)]?\s*CITIZEN"],
+            x_min=anchor.x_min,
             x_max=1e9,
         )
         formatted = _format_person_name_blocks(region)
@@ -394,8 +415,10 @@ def _extract_mother_maiden_name(blocks: List[OCRBlock], full_text: str) -> str:
 
 
 def _extract_father_name(blocks: List[OCRBlock], full_text: str) -> str:
-    # Item 14. NAME (Father) appears well below Item 7. MAIDEN NAME (Mother).
-    mother_anchor = _find_anchor(blocks, [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"MAIDEN\s*NAME"])
+    mother_anchor = _find_anchor(
+        blocks,
+        [r"\b7[\.\)]?\s*MAIDEN\s*NAME\b", r"\b7[\.\)]?\s*MAIDEN\b", r"MAIDEN\s*NAME"],
+    )
     min_y = mother_anchor.y_max if mother_anchor else 0.0
 
     anchor = _find_anchor(blocks, [r"\b14[\.\)]?\s*NAME\b"], min_y=min_y)
@@ -408,8 +431,8 @@ def _extract_father_name(blocks: List[OCRBlock], full_text: str) -> str:
         region = _collect_region_blocks(
             blocks,
             anchor,
-            stop_patterns=[r"\b15[\.\)]?\s*CITIZENSHIP\b", r"\b16[\.\)]?\s*RELIGION\b"],
-            x_min=0.0,
+            stop_patterns=[r"^\s*15[\.\)]", r"^\s*16[\.\)]", r"^\s*19[\.\)]", r"\b15[\.\)]?\s*CITIZEN"],
+            x_min=anchor.x_min,
             x_max=1e9,
         )
         formatted = _format_person_name_blocks(region)
@@ -425,4 +448,3 @@ def _extract_father_name(blocks: List[OCRBlock], full_text: str) -> str:
         candidate = re.sub(r"\(First\)|\(Middle\)|\(Last\)", "", m.group(1), flags=re.IGNORECASE).strip()
         return _format_first_middle_last_text(candidate)
     return ""
-
